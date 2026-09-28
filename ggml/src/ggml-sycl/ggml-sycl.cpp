@@ -868,6 +868,49 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// Strided upload for the tensor-split (meta) backend, which writes each device's slice of a split
+// weight as n_copies rows. Without this the generic fallback issued one set_tensor per row, each
+// draining the device queues and blocking on a tiny memcpy; a split 3-D MoE expert tensor is
+// ne1*ne2 rows, so tensor-parallel loads made millions of synchronous copies.
+static void ggml_backend_sycl_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+                                                   const void * data, size_t offset, size_t size,
+                                                   size_t n_copies, size_t stride_tensor,
+                                                   size_t stride_data) try {
+    ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
+    ggml_sycl_set_device(ctx->device);
+    auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
+    SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
+
+    char *       dst = (char *) tensor->data + offset;
+    const char * src = (const char *) data;
+
+    if (stride_tensor == size) {
+        // Contiguous destination: gather the strided source rows into bounded host batches.
+        const size_t max_batch_bytes = 64u << 20;
+        const size_t rows_per_batch  = std::max<size_t>(1, max_batch_bytes / std::max<size_t>(size, 1));
+        std::vector<char> host_buf(std::min(n_copies, rows_per_batch) * size);
+        for (size_t i0 = 0; i0 < n_copies; i0 += rows_per_batch) {
+            const size_t n = std::min(rows_per_batch, n_copies - i0);
+            for (size_t i = 0; i < n; ++i) {
+                memcpy(host_buf.data() + i * size, src + (i0 + i) * stride_data, size);
+            }
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(dst + i0 * size, host_buf.data(), n * size).wait()));
+        }
+        return;
+    }
+
+    // Strided destination: queue every row, then wait once.
+    for (size_t i = 0; i < n_copies; ++i) {
+        stream->memcpy(dst + i * stride_tensor, src + i * stride_data, size);
+    }
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
 static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                 const ggml_tensor *tensor,
                                                 void *data, size_t offset,
@@ -1086,7 +1129,7 @@ static const ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = {
     /* .memset_tensor   = */ ggml_backend_sycl_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_sycl_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_sycl_buffer_get_tensor,
-    /* .set_tensor_2d   = */ NULL,
+    /* .set_tensor_2d   = */ ggml_backend_sycl_buffer_set_tensor_2d,
     /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ ggml_backend_sycl_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_sycl_buffer_clear,

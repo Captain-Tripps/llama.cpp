@@ -489,6 +489,23 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
         const int8_t *  qs   = reinterpret_cast<const int8_t *>(base + ibx_offset.first);
         const ggml_half  d   = *reinterpret_cast<const ggml_half *>(base + d_offset.first);
 
+        if (vdr == q8_0_traits::vdr_mmvq) {
+            // Reordered qs blocks are 32 contiguous bytes and iqs is a multiple of vdr_mmvq, so each
+            // lane's 4 ints (weights and q8_1 activations) are 16-byte aligned: one vector load each
+            // instead of 8 two-byte + 4 four-byte scalar loads.
+            static_assert(q8_0_traits::vdr_mmvq == 4, "vector load assumes vdr_mmvq == 4");
+            const sycl::int4 v = *reinterpret_cast<const sycl::int4 *>(qs + sizeof(int) * iqs);
+            const sycl::int4 u = *reinterpret_cast<const sycl::int4 *>(q8_1_quant_ptr + sizeof(int) * iqs);
+
+            int sumi = 0;
+            sumi = dpct::dp4a(v.x(), u.x(), sumi);
+            sumi = dpct::dp4a(v.y(), u.y(), sumi);
+            sumi = dpct::dp4a(v.z(), u.z(), sumi);
+            sumi = dpct::dp4a(v.w(), u.w(), sumi);
+            const sycl::half2 ds_values = *q8_1_ds;
+            return static_cast<float>(d) * static_cast<float>(ds_values[0]) * sumi;
+        }
+
         int v[q8_0_traits::vdr_mmvq];
         int u[q8_0_traits::vdr_mmvq];
 

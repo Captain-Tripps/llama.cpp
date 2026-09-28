@@ -907,7 +907,8 @@ static void lauch_kernel(
 template <int DV, int ncols1, int ncols2, fattn_kernel_t fattn_kernel, int warp_size, bool use_large_grf = false>
 void launch_fattn(
     ggml_backend_sycl_context & ctx, ggml_tensor * dst, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k) {
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k,
+    const bool tile_kernel = false) {
 
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1101,6 +1102,17 @@ void launch_fattn(
                 nwaves_best = nwaves;
                 efficiency_percent_best = efficiency_percent;
                 parallel_blocks = parallel_blocks_test;
+            }
+        }
+
+        // Xe2 (BMG) TILE decode: the wave-efficiency heuristic above settles on very few KV
+        // splits (nsm undercounts Xe2 cores), leaving each work-group a long serial walk over
+        // the KV cache. 48 splits measured +5.5% (Qwen3.8-27B) and +17% (Mistral-Small-3.2-24B)
+        // decode at 32k context on Arc Pro B70.
+        if (tile_kernel && Q->ne[1] <= 2) {
+            const gpu_arch arch = ggml_sycl_info().devices[id].hw_info.arch;
+            if (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31) {
+                parallel_blocks = std::min(std::max(parallel_blocks, 48), ntiles_KQ);
             }
         }
 

@@ -144,7 +144,7 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
     }
 }
 
-template <bool do_multiply = false, bool do_add = false>
+template <bool do_multiply = false, bool do_add = false, bool do_pre_add = false>
 static void rms_norm_f32(const float* x, float* dst, const int ncols,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
     const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
@@ -153,8 +153,9 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
     const int64_t mul_stride_sample = 0, const int mul_nrows = 0, const int mul_nchannels = 0, const int mul_nsamples = 0,
     const float* add = nullptr, const int64_t add_stride_row = 0, const int64_t add_stride_channel = 0,
     const int64_t add_stride_sample = 0, const int add_nrows = 0, const int add_nchannels = 0, const int add_nsamples = 0,
-    const float scale_mul = 1.0f) {
+    const float scale_mul = 1.0f, const float * pre_b = nullptr, float * pre_out = nullptr) {
 
+    static_assert(!do_pre_add || do_multiply, "pre-add fusion writes the normalised product");
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
 
     const int sample  = item_ct1.get_group(0);
@@ -171,6 +172,10 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
 
     x   += src_offset;
     dst += dst_offset;
+    if constexpr (do_pre_add) {
+        pre_b   += src_offset;
+        pre_out += src_offset;
+    }
 
     if constexpr (do_multiply) {
         const int mul_row     = row     % mul_nrows;
@@ -189,7 +194,12 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
     float tmp = 0.0f; // partial sum for thread in warp
 
     for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col * src_stride_col];
+        float xi = x[col * src_stride_col];
+        if constexpr (do_pre_add) {
+            // the ADD result is materialised (residual) and normalised from the same float
+            xi += pre_b[col * src_stride_col];
+            pre_out[col * src_stride_col] = xi;
+        }
         tmp += xi * xi;
     }
 
@@ -220,7 +230,9 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
         if constexpr (do_multiply && do_add) {
             dst[col * dst_stride_col] = scale * x[col * src_stride_col] * mul[col] + add[col];
         } else if constexpr (do_multiply) {
-            dst[col * dst_stride_col] = scale * x[col * src_stride_col] * mul[col];
+            // with do_pre_add this work-item wrote pre_out[col] in the first loop
+            const float xi = do_pre_add ? pre_out[col * src_stride_col] : x[col * src_stride_col];
+            dst[col * dst_stride_col] = scale * xi * mul[col];
         } else {
             // folded epilogue of a fused GGML_OP_SCALE consumer (qwen35 GDN l2 norms);
             // the explicit temporary keeps the float evaluation order identical to
@@ -483,6 +495,53 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size,
                         mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples);
+                });
+            });
+    }
+}
+
+// ADD -> RMS_NORM -> MUL in one pass: y = a + b is written out (it stays live as the residual),
+// and the norm/mul epilogue matches the unfused kernels' float evaluation order exactly.
+static void add_rms_norm_mul_f32_sycl(const float* a, const float* b, float* sum_out, const float* mul, float* dst,
+        const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
+        const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
+        const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
+        const int mul_nrows, const int mul_nchannels, const int mul_nsamples,
+        const float eps, queue_ptr stream, int device) {
+    const sycl::range<3> global_dims(nsamples, nchannels, nrows);
+    if (ncols < 1024) {
+        const sycl::range<3> block_dims(1, 1, WARP_SIZE);
+        stream->submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(global_dims * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    rms_norm_f32<true, false, true>(a, dst, ncols,
+                        src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
+                        dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
+                        eps, item_ct1, nullptr, WARP_SIZE,
+                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
+                        nullptr, 0, 0, 0, 0, 0, 0, 1.0f, b, sum_out);
+                });
+            });
+    }
+    else {
+        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
+        assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
+        const sycl::range<3> block_dims(1, 1, work_group_size);
+        stream->submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
+            cgh.parallel_for(
+                sycl::nd_range<3>(global_dims * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    rms_norm_f32<true, false, true>(a, dst, ncols,
+                        src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
+                        dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
+                        eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size,
+                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
+                        nullptr, 0, 0, 0, 0, 0, 0, 1.0f, b, sum_out);
                 });
             });
     }
@@ -1134,4 +1193,41 @@ void ggml_sycl_l2_norm_batch(ggml_backend_sycl_context & ctx, ggml_tensor ** nod
     st.ds0 = d0->nb[0] / ts; st.ds1 = d0->nb[1] / ts; st.ds2 = d0->nb[2] / ts; st.ds3 = d0->nb[3] / ts;
 
     l2_norm_f32_batch_sycl<WARP_SIZE>(p, st, count, ncols, nrows_total, eps, ctx.stream());
+}
+
+// Fused {ADD, RMS_NORM, MUL}: add_node = a + b (kept, it is the residual), rms_node = rms_norm(add_node),
+// mul_node = rms_node * w. Caller has checked f32, same-shape contiguous operands and a row-wide weight.
+void ggml_sycl_op_add_rms_norm_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * add_node,
+                                         ggml_tensor * rms_node, ggml_tensor * mul_node) {
+    float eps = 0.0f;
+    memcpy(&eps, rms_node->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const ggml_tensor * a     = add_node->src[0];
+    const ggml_tensor * b     = add_node->src[1];
+    const ggml_tensor * mul_w = mul_node->src[0] == rms_node ? mul_node->src[1] : mul_node->src[0];
+
+    dpct::queue_ptr main_stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    const int64_t ne00 = add_node->ne[0];
+    const int64_t ne01 = add_node->ne[1];
+    const int64_t ne02 = add_node->ne[2];
+    const int64_t ne03 = add_node->ne[3];
+
+    const size_t  ts  = sizeof(float);
+    const int64_t s00 = add_node->nb[0] / ts;
+    const int64_t s01 = add_node->nb[1] / ts;
+    const int64_t s02 = add_node->nb[2] / ts;
+    const int64_t s03 = add_node->nb[3] / ts;
+    const int64_t d00 = mul_node->nb[0] / ts;
+    const int64_t d01 = mul_node->nb[1] / ts;
+    const int64_t d02 = mul_node->nb[2] / ts;
+    const int64_t d03 = mul_node->nb[3] / ts;
+
+    add_rms_norm_mul_f32_sycl(static_cast<const float *>(a->data), static_cast<const float *>(b->data),
+        static_cast<float *>(add_node->data), static_cast<const float *>(mul_w->data), static_cast<float *>(mul_node->data),
+        ne00, ne01, ne02, ne03, s00, s01, s02, s03, d00, d01, d02, d03,
+        mul_w->nb[1] / ts, mul_w->nb[2] / ts, mul_w->nb[3] / ts, mul_w->ne[1], mul_w->ne[2], mul_w->ne[3],
+        eps, main_stream, ctx.device);
 }

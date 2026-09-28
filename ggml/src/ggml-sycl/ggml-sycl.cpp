@@ -6535,6 +6535,51 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// {ADD, RMS_NORM, MUL} where the ADD result stays live as the next residual. That gives the group
+// two outputs (ADD and MUL), which the single-output chain check ggml_can_fuse cannot express.
+static bool ggml_sycl_can_fuse_add_rms_norm_mul(const ggml_cgraph * cgraph, int i) {
+    if (!g_ggml_sycl_enable_fusion || i + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * add = cgraph->nodes[i];
+    const ggml_tensor * rms = cgraph->nodes[i + 1];
+    const ggml_tensor * mul = cgraph->nodes[i + 2];
+    if (add->op != GGML_OP_ADD || rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) {
+        return false;
+    }
+    if (rms->src[0] != add || (mul->src[0] != rms && mul->src[1] != rms)) {
+        return false;
+    }
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 })) {
+        return false;
+    }
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    for (const ggml_tensor * t : { a, b, add, rms, mul, w }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    // no broadcast of the residual operands; one contiguous layout shared by a, b and the sum
+    if (!ggml_are_same_shape(a, add) || !ggml_are_same_shape(b, add) || !ggml_are_same_shape(mul, add)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(add) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    // the kernel indexes the weight as w[col] and broadcasts it like the unfused MUL
+    if (w->ne[0] != add->ne[0] || w->nb[0] != sizeof(float) || !ggml_is_contiguous_rows(w)) {
+        return false;
+    }
+    for (int d = 1; d < 4; ++d) {
+        if (add->ne[d] % w->ne[d] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
 
@@ -6569,6 +6614,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 i += gdn_nodes_to_skip;
                 continue;
             }
+        }
+        if (node->op == GGML_OP_ADD && ggml_sycl_can_fuse_add_rms_norm_mul(cgraph, i)) {
+            ggml_sycl_op_add_rms_norm_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            i += 2;
+            continue;
         }
         if (node->op == GGML_OP_RMS_NORM &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {

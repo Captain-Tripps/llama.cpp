@@ -3318,7 +3318,7 @@ static void launch_mul_mat_vec_q_reorder_glu_impl(const void * vx, const void * 
                                              const int ncols, const int nrows, const int stride_col_y_bytes,
                                              const int stride_col_dst, const ggml_glu_op glu_op,
                                              dpct::queue_ptr stream) {
-    GGML_ASSERT(ncols % QK_K == 0);
+    GGML_ASSERT(ncols % ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>::traits::qk == 0);
 
     constexpr size_t num_subgroups = WARP_SIZE;
 
@@ -3578,6 +3578,11 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
         case GGML_TYPE_Q5_K:
             // fusion declines q5_K past 5 columns
             return mul_mat_vec_q_glu_reorder_ncols<GGML_TYPE_Q5_K, 1, 2, 3, 4, 5>(
+                glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst, stride_col_y_bytes, stride_col_dst, stream);
+        case GGML_TYPE_Q8_0:
+            // no shared-weight/activation specialisation: every width takes the generic
+            // one-row-per-sub-group fused branch
+            return mul_mat_vec_q_glu_reorder_ncols<GGML_TYPE_Q8_0, 1, 2, 3, 4, 5, 6, 7, 8>(
                 glu_op, vx, vgate, vy, dst, ncols, nrows, ncols_dst, stride_col_y_bytes, stride_col_dst, stream);
         default:
             return false;

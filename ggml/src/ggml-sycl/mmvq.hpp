@@ -36,6 +36,11 @@ void ggml_sycl_mul_mat_vec_q8_0_grouped_reorder(const void * vx, const void * vy
                                                 size_t y_group_stride_bytes, dpct::queue_ptr stream);
 
 // Grouped plain-layout Q8_0 mat-vec (one activation column per src0 batch), single launch.
+// one-launch mat-vec over the ne[2] slices of a batched quantized weight (Q4_K / Q5_K / Q6_K), 1..8 columns per slice
+bool ggml_sycl_mul_mat_vec_q_grouped(ggml_type type, const void * vx, const void * vy, float * dst, int ncols,
+                                     int nrows_per_group, int ngroups, int ncols_dst, int y_blocks_per_row,
+                                     size_t x_group_stride_bytes, dpct::queue_ptr stream);
+
 void ggml_sycl_mul_mat_vec_q8_0_grouped(const void * vx, const void * vy, float * dst, int ncols, int nrows_per_group,
                                         int ngroups, int y_blocks_per_group, dpct::queue_ptr stream);
 

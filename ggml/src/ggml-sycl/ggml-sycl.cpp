@@ -6255,6 +6255,53 @@ static void ggml_sycl_mul_mat_q8_0_grouped_slices(ggml_backend_sycl_context & ct
     }
 }
 
+// Batched (3-D) Q4_K/Q5_K/Q6_K weight times 1..8 columns per slice, as GLM-5's MLA attn_k_b / attn_v_b: one quantize and one
+// mat-vec launch instead of a 2-D call per slice. src1 may be a permuted view; it is gathered into dense columns first.
+static bool ggml_sycl_mul_mat_vec_q_grouped_op(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+                                               const ggml_tensor * src1, ggml_tensor * dst) {
+    static const bool disabled = ggml_sycl_get_env("GGML_SYCL_DISABLE_QK_GROUPED_MMV", 0) != 0;
+    if (disabled || dst->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    if (!(src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q4_K)) {
+        return false;
+    }
+    const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src0->ne[2] <= 1 || src0->ne[3] != 1 ||
+        src1->ne[2] != src0->ne[2] || src1->ne[3] != 1 || src1->ne[1] < 1 || src1->ne[1] > 8 ||
+        src0->ne[0] != src1->ne[0] || src0->ne[0] % QK_K != 0 || !ggml_is_contiguous(src0) ||
+        !ggml_is_contiguous(dst) || src1->nb[0] != sizeof(float) || ggml_backend_buffer_is_sycl_split(src0->buffer) ||
+        (extra && extra->optimized_feature.reorder) ||
+        (int64_t) src0->ne[1] * src0->ne[2] >= INT_MAX) {
+        return false;
+    }
+    const int ne00 = (int) src0->ne[0], ne01 = (int) src0->ne[1], ngroups = (int) src0->ne[2];
+    const int ncols_dst = (int) src1->ne[1];
+    const queue_ptr stream = ctx.stream();
+
+    const size_t col_bytes = (size_t) ne00 * sizeof(float);
+    const bool   dense     = src1->nb[1] == col_bytes && src1->nb[2] == col_bytes * (size_t) ncols_dst;
+    ggml_sycl_pool_alloc<float> src1_dense(ctx.pool());
+    const float * src1_ptr = (const float *) src1->data;
+    if (!dense) {
+        src1_dense.alloc((size_t) ne00 * ncols_dst * ngroups);
+        float *      to   = src1_dense.get();
+        const char * from = (const char *) src1->data;
+        const size_t nb1 = src1->nb[1], nb2 = src1->nb[2];
+        const int    n1  = ncols_dst;
+        stream->parallel_for(sycl::range<3>((size_t) ngroups, (size_t) n1, (size_t) ne00), [=](sycl::id<3> id) {
+            to[((size_t) id[0] * n1 + id[1]) * ne00 + id[2]] =
+                *(const float *) (from + id[0] * nb2 + id[1] * nb1 + id[2] * sizeof(float));
+        });
+        src1_ptr = to;
+    }
+    const int padded_cols = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+    ggml_sycl_pool_alloc<char> src1_q8(ctx.pool(), (size_t) ngroups * ncols_dst * padded_cols * sizeof(block_q8_1) / QK8_1);
+    quantize_row_q8_1_sycl<quantize_q8_1>(src1_ptr, src1_q8.get(), ne00, ncols_dst * ngroups, padded_cols, stream);
+    return ggml_sycl_mul_mat_vec_q_grouped(src0->type, src0->data, src1_q8.get(), (float *) dst->data, ne00, ne01, ngroups,
+                                           ncols_dst, padded_cols / QK8_1, src0->nb[2], stream);
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
 
@@ -6265,6 +6312,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     if (dst->op == GGML_OP_MUL_MAT && ggml_sycl_can_use_bf16_mmv(src0, src1, dst)) {
         ggml_sycl_mul_mat_vec_bf16(ctx, src0, src1, dst);
+        return;
+    }
+
+    if (ggml_sycl_mul_mat_vec_q_grouped_op(ctx, src0, src1, dst)) {
         return;
     }
 

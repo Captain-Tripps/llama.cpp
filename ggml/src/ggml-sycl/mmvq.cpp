@@ -4144,3 +4144,83 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
             return false;
     }
 }
+
+// Grouped plain-layout mat-vec for batched 3-D quantized weights (e.g. GLM-5 MLA attn_k_b / attn_v_b, [k, m, heads]):
+// one launch instead of one per head. Group g uses its own ncols_dst activation columns (quantize_q8_1 rows g*ncols_dst+c,
+// y_blocks_per_row block_q8_1 apart) and writes dst[(g*ncols_dst + c)*nrows_per_group + row].
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
+static void mul_mat_vec_q_grouped_sycl(const void * vx, const void * vy, float * dst, const int ncols,
+                                       const int nrows_per_group, const int ngroups, const int ncols_dst,
+                                       const int y_blocks_per_row, const size_t x_group_stride_bytes,
+                                       dpct::queue_ptr stream) {
+    const int nrows = nrows_per_group * ngroups;
+    constexpr int rows_per_wg = 16;
+    const sycl::range<3> block_nums(1, 1, (nrows + rows_per_wg - 1) / rows_per_wg);
+    const sycl::range<3> block_dims(1, rows_per_wg, WARP_SIZE);
+    stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+        const int grow = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+        if (grow >= nrows) {
+            return;
+        }
+        const int group = grow / nrows_per_group;
+        const int row   = grow % nrows_per_group;
+        const int     blocks_per_row  = ncols / qk;
+        constexpr int blocks_per_warp = (vdr * WARP_SIZE + qi - 1) / qi;
+
+        const block_q_t *  x  = (const block_q_t *) ((const char *) vx + (size_t) group * x_group_stride_bytes);
+        const block_q8_1 * y0 = (const block_q8_1 *) vy + (size_t) group * ncols_dst * y_blocks_per_row;
+
+        float tmp[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
+            const int ibx = row * blocks_per_row + i;
+            const int iby = i * (qk / QK8_1);
+            for (size_t elem = 0; elem < qi / vdr; elem += WARP_SIZE) {
+                const int iqs = elem + vdr * (item_ct1.get_local_id(2) % (qi / vdr));
+#pragma unroll
+                for (int c = 0; c < 8; ++c) {
+                    if (c < ncols_dst) {
+                        tmp[c] += vec_dot_q_sycl(&x[ibx], &y0[c * y_blocks_per_row + iby], iqs);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            if (c < ncols_dst) {
+                float v = tmp[c];
+#pragma unroll
+                for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+                    v += dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), v, mask);
+                }
+                if (item_ct1.get_local_id(2) == 0) {
+                    dst[((size_t) group * ncols_dst + c) * nrows_per_group + row] = v;
+                }
+            }
+        }
+    });
+}
+
+bool ggml_sycl_mul_mat_vec_q_grouped(ggml_type type, const void * vx, const void * vy, float * dst, int ncols,
+                                     int nrows_per_group, int ngroups, int ncols_dst, int y_blocks_per_row,
+                                     size_t x_group_stride_bytes, dpct::queue_ptr stream) {
+    if (ncols_dst < 1 || ncols_dst > 8) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_Q6_K:
+            mul_mat_vec_q_grouped_sycl<QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(
+                vx, vy, dst, ncols, nrows_per_group, ngroups, ncols_dst, y_blocks_per_row, x_group_stride_bytes, stream);
+            return true;
+        case GGML_TYPE_Q5_K:
+            mul_mat_vec_q_grouped_sycl<QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>(
+                vx, vy, dst, ncols, nrows_per_group, ngroups, ncols_dst, y_blocks_per_row, x_group_stride_bytes, stream);
+            return true;
+        case GGML_TYPE_Q4_K:
+            mul_mat_vec_q_grouped_sycl<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>(
+                vx, vy, dst, ncols, nrows_per_group, ngroups, ncols_dst, y_blocks_per_row, x_group_stride_bytes, stream);
+            return true;
+        default:
+            return false;
+    }
+}

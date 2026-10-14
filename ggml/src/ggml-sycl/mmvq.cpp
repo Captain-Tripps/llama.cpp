@@ -3185,6 +3185,26 @@ template <> struct moe_iq_traits<GGML_TYPE_IQ3_XXS> {
     }
 };
 
+// IQ2_S / IQ3_S only need the block type here (the v3 kernel below is the one used); the dots fall back to the
+// generic vec_dots, which bind their own tables.
+template <> struct moe_iq_traits<GGML_TYPE_IQ2_S> {
+    using block_t = block_iq2_s;
+    static constexpr int table_bytes = 16;
+    static __dpct_inline__ void fill(uint64_t *, const int, const int) {}
+    static __dpct_inline__ float dot(const block_t * x, const block_q8_1 * y, const int ib32, const uint64_t *) {
+        return vec_dot_iq2_s_q8_1(x, y, ib32);
+    }
+};
+
+template <> struct moe_iq_traits<GGML_TYPE_IQ3_S> {
+    using block_t = block_iq3_s;
+    static constexpr int table_bytes = 16;
+    static __dpct_inline__ void fill(uint64_t *, const int, const int) {}
+    static __dpct_inline__ float dot(const block_t * x, const block_q8_1 * y, const int ib32, const uint64_t *) {
+        return vec_dot_iq3_s_q8_1(x, y, ib32, iq3s_grid);
+    }
+};
+
 template <ggml_type TYPE, int NSG, int RPS>
 static void mul_mat_vec_q_moe_iq_slm(
     const char * __restrict__ vx_base, const char * __restrict__ vy_base,
@@ -3368,6 +3388,68 @@ template <> struct moe_iq3_traits<GGML_TYPE_IQ3_XXS> {
             sumi = dpct::dp4a(gh, yi[2 * l + 1], sumi);
         }
         const float d = (float) bq->d * (0.5f + (aux32 >> 28)) * yd * 0.5f;
+        return d * sumi;
+    }
+};
+
+// IQ2_S: 10-bit grid index (qs | 2 bits of qh), 8 explicit sign bits per 8 weights, one 4-bit scale per 16 weights.
+template <> struct moe_iq3_traits<GGML_TYPE_IQ2_S> {
+    using block_t = block_iq2_s;
+    using tbl_t   = uint64_t;
+    // the 8 KiB grid is read from global memory (cached): staging it in local memory was slower (bank conflicts
+    // on the 10-bit random index); GGML_SYCL_MOE_IQ2S_SLM_GRID=1 at build time restores the staged table
+    static constexpr int table_bytes = 16;
+    static __dpct_inline__ void fill(uint64_t *, const int, const int) {}
+    static __dpct_inline__ float dot(const block_t * bq, const sycl::int4 * yq, const float yd, const int ib32,
+                                     const uint64_t * grid) {
+        const uint8_t *  qs    = bq->qs + 4 * ib32;
+        const uint8_t *  signs = bq->qs + QK_K / 8 + 4 * ib32;
+        const uint32_t   qh    = bq->qh[ib32];
+        const uint32_t   sc    = bq->scales[ib32];
+        const int yi[8] = { yq[0].x(), yq[0].y(), yq[0].z(), yq[0].w(), yq[1].x(), yq[1].y(), yq[1].z(), yq[1].w() };
+        int sumi1 = 0;
+        int sumi2 = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint64_t g = iq2s_grid[qs[l] | ((qh << (8 - 2 * l)) & 0x300)];
+            const uint32_t s8 = signs[l];
+            const int gl = moe_apply_sign((uint32_t) g, moe_sign_mask4(s8 & 0xFu));
+            const int gh = moe_apply_sign((uint32_t) (g >> 32), moe_sign_mask4(s8 >> 4));
+            int s = dpct::dp4a(gl, yi[2 * l + 0], 0);
+            s     = dpct::dp4a(gh, yi[2 * l + 1], s);
+            if (l < 2) { sumi1 += s; } else { sumi2 += s; }
+        }
+        const float d = (float) bq->d * yd * 0.25f;
+        return d * ((0.5f + (sc & 0xf)) * sumi1 + (0.5f + (sc >> 4)) * sumi2);
+    }
+};
+
+// IQ3_S: two 9-bit grid indices per 8 weights (qs | 1 bit of qh), 8 explicit sign bits, one 4-bit scale per 32 weights.
+template <> struct moe_iq3_traits<GGML_TYPE_IQ3_S> {
+    using block_t = block_iq3_s;
+    using tbl_t   = uint32_t;
+    static constexpr int table_bytes = 512 * 4;
+    static __dpct_inline__ void fill(uint64_t * slm, const int tid, const int nthr) {
+        uint32_t * g = (uint32_t *) slm;
+        for (int i = tid; i < 512; i += nthr) { g[i] = iq3s_grid[i]; }
+    }
+    static __dpct_inline__ float dot(const block_t * bq, const sycl::int4 * yq, const float yd, const int ib32,
+                                     const uint32_t * grid) {
+        const uint8_t * qs    = bq->qs + 8 * ib32;
+        const uint8_t * signs = bq->signs + 4 * ib32;
+        const uint32_t  qh    = bq->qh[ib32];
+        const uint32_t  sc    = (bq->scales[ib32 / 2] >> (4 * (ib32 & 1))) & 0xf;
+        const int yi[8] = { yq[0].x(), yq[0].y(), yq[0].z(), yq[0].w(), yq[1].x(), yq[1].y(), yq[1].z(), yq[1].w() };
+        int sumi = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t g1 = grid[qs[2 * l + 0] | ((qh << (8 - 2 * l)) & 256)];
+            const uint32_t g2 = grid[qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256)];
+            const uint32_t s8 = signs[l];
+            sumi = dpct::dp4a(moe_apply_sign(g1, moe_sign_mask4(s8 & 0xFu)), yi[2 * l + 0], sumi);
+            sumi = dpct::dp4a(moe_apply_sign(g2, moe_sign_mask4(s8 >> 4)), yi[2 * l + 1], sumi);
+        }
+        const float d = (float) bq->d * (1.0f + 2.0f * (float) sc) * yd;
         return d * sumi;
     }
 };
@@ -3671,6 +3753,10 @@ bool ggml_sycl_mul_mat_vec_q_id(
                 expert_weight_stride, dst_row_stride, src1_row_stride, src1_row_div, stream);
             return true;
         case GGML_TYPE_IQ2_S:
+            if (launch_moe_iq_slm<GGML_TYPE_IQ2_S>(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                    expert_weight_stride, dst_row_stride, src1_row_stride, src1_row_div, stream)) {
+                return true;
+            }
             launch_mul_mat_vec_q_moe<QK_K, QI2_S/2, block_iq2_s, VDR_IQ2_S_Q8_1_MMVQ, vec_dot_iq2_s_q8_1>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                 expert_weight_stride, dst_row_stride, src1_row_stride, src1_row_div, stream);
@@ -3685,7 +3771,11 @@ bool ggml_sycl_mul_mat_vec_q_id(
                 expert_weight_stride, dst_row_stride, src1_row_stride, src1_row_div, stream);
             return true;
         case GGML_TYPE_IQ3_S:
-            launch_mul_mat_vec_q_moe<QK_K, QI3_S/2, block_iq3_s, VDR_IQ3_S_Q8_1_MMVQ, vec_dot_iq3_s_q8_1_adapter>(
+            if (launch_moe_iq_slm<GGML_TYPE_IQ3_S>(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                    expert_weight_stride, dst_row_stride, src1_row_stride, src1_row_div, stream)) {
+                return true;
+            }
+            launch_mul_mat_vec_q_moe<QK_K, QI3_S/2, block_iq3_s, VDR_IQ3_S_Q8_1_MMVQ, vec_dot_iq3_s_q8_1_moe>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                 expert_weight_stride, dst_row_stride, src1_row_stride, src1_row_div, stream);
             return true;

@@ -533,10 +533,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
         }
         if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
-            ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+            // local: an op without sources (ARANGE, FILL of a fresh tensor, ...) computes the same data on every
+            // device, so its result is mirrored
+            ret = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+        }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            GGML_LOG_ERROR("meta split: cannot derive split of %s (%s, scalar_only=%d); sources:\n", tensor->name, ggml_op_desc(tensor), (int) scalar_only);
+            for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                if (tensor->src[i] != nullptr && tensor->src[i] != tensor) {
+                    GGML_LOG_ERROR("  src%zu %s (%s) axis=%d ne=[%lld,%lld,%lld,%lld]\n", i, tensor->src[i]->name, ggml_op_desc(tensor->src[i]), (int) src_ss[i].axis,
+                        (long long) tensor->src[i]->ne[0], (long long) tensor->src[i]->ne[1], (long long) tensor->src[i]->ne[2], (long long) tensor->src[i]->ne[3]);
+                }
+            }
         }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         return ret;

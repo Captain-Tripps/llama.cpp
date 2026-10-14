@@ -3205,6 +3205,15 @@ template <> struct moe_iq_traits<GGML_TYPE_IQ3_S> {
     }
 };
 
+template <> struct moe_iq_traits<GGML_TYPE_IQ2_XXS> {
+    using block_t = block_iq2_xxs;
+    static constexpr int table_bytes = 16;
+    static __dpct_inline__ void fill(uint64_t *, const int, const int) {}
+    static __dpct_inline__ float dot(const block_t * x, const block_q8_1 * y, const int ib32, const uint64_t *) {
+        return vec_dot_iq2_xxs_q8_1(x, y, ib32, iq2xxs_grid, ksigns_iq2xs, kmask_iq2xs);
+    }
+};
+
 template <ggml_type TYPE, int NSG, int RPS>
 static void mul_mat_vec_q_moe_iq_slm(
     const char * __restrict__ vx_base, const char * __restrict__ vy_base,
@@ -3450,6 +3459,35 @@ template <> struct moe_iq3_traits<GGML_TYPE_IQ3_S> {
             sumi = dpct::dp4a(moe_apply_sign(g2, moe_sign_mask4(s8 >> 4)), yi[2 * l + 1], sumi);
         }
         const float d = (float) bq->d * (1.0f + 2.0f * (float) sc) * yd;
+        return d * sumi;
+    }
+};
+
+// IQ2_XXS: per 32 weights two uint32: four 8-bit grid indices, then four 7-bit sign codes (8th bit = parity) and a
+// 4-bit scale in the top bits.
+template <> struct moe_iq3_traits<GGML_TYPE_IQ2_XXS> {
+    using block_t = block_iq2_xxs;
+    using tbl_t   = uint64_t;
+    static constexpr int table_bytes = 256 * 8;
+    static __dpct_inline__ void fill(uint64_t * slm, const int tid, const int nthr) {
+        for (int i = tid; i < 256; i += nthr) { slm[i] = iq2xxs_grid[i]; }
+    }
+    static __dpct_inline__ float dot(const block_t * bq, const sycl::int4 * yq, const float yd, const int ib32,
+                                     const uint64_t * grid) {
+        const uint16_t * q2   = bq->qs + 4 * ib32;
+        const uint32_t   aux0 = (uint32_t) q2[0] | ((uint32_t) q2[1] << 16);
+        const uint32_t   aux1 = (uint32_t) q2[2] | ((uint32_t) q2[3] << 16);
+        const int yi[8] = { yq[0].x(), yq[0].y(), yq[0].z(), yq[0].w(), yq[1].x(), yq[1].y(), yq[1].z(), yq[1].w() };
+        int sumi = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint64_t g = grid[(aux0 >> (8 * l)) & 0xFF];
+            uint32_t sl, sh;
+            moe_sign_masks((aux1 >> (7 * l)) & 127u, sl, sh);
+            sumi = dpct::dp4a(moe_apply_sign((uint32_t) g, sl), yi[2 * l + 0], sumi);
+            sumi = dpct::dp4a(moe_apply_sign((uint32_t) (g >> 32), sh), yi[2 * l + 1], sumi);
+        }
+        const float d = (float) bq->d * (0.5f + (float) (aux1 >> 28)) * yd * 0.25f;
         return d * sumi;
     }
 };
@@ -3739,6 +3777,10 @@ bool ggml_sycl_mul_mat_vec_q_id(
                 expert_weight_stride, dst_row_stride, src1_row_stride, src1_row_div, stream);
             return true;
         case GGML_TYPE_IQ2_XXS:
+            if (launch_moe_iq_slm<GGML_TYPE_IQ2_XXS>(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                    expert_weight_stride, dst_row_stride, src1_row_stride, src1_row_div, stream)) {
+                return true;
+            }
             launch_mul_mat_vec_q_moe<QK_K, QI2_XXS/2, block_iq2_xxs, VDR_IQ2_XXS_Q8_1_MMVQ, vec_dot_iq2_xxs_q8_1_moe>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                 expert_weight_stride, dst_row_stride, src1_row_stride, src1_row_div, stream);

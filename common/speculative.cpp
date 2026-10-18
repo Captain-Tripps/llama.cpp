@@ -1393,8 +1393,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (id < 0 || id >= llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)))) {
                         static int n_warned = 0;
                         if (n_warned++ < 16) {
-                            LOG_WRN("%s: discarding draft from position %d: invalid token id %d from the draft sampler
-", __func__, i, id);
+                            LOG_WRN("%s: discarding draft from position %d: invalid token id %d from the draft sampler\n", __func__, i, id);
                         }
                         break;
                     }
@@ -1423,8 +1422,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (id < 0 || id >= llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)))) {
                         static int n_warned = 0;
                         if (n_warned++ < 16) {
-                            LOG_WRN("%s: discarding draft from position %d: invalid token id %d from the draft sampler
-", __func__, i, id);
+                            LOG_WRN("%s: discarding draft from position %d: invalid token id %d from the draft sampler\n", __func__, i, id);
                         }
                         break;
                     }

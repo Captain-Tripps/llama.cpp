@@ -3162,26 +3162,25 @@ template <ggml_type TYPE> struct moe_iq_traits;
 
 template <> struct moe_iq_traits<GGML_TYPE_IQ2_XS> {
     using block_t = block_iq2_xs;
-    static constexpr int table_bytes = 512 * 8 + 128 * 8;
+    // upstream derives the signs arithmetically now: only the grid goes to local memory
+    static constexpr int table_bytes = 512 * 8;
     static __dpct_inline__ void fill(uint64_t * slm, const int tid, const int nthr) {
         for (int i = tid; i < 512; i += nthr) { slm[i] = iq2xs_grid[i]; }
-        for (int i = tid; i < 128; i += nthr) { slm[512 + i] = ksigns64[i]; }
     }
     static __dpct_inline__ float dot(const block_t * x, const block_q8_1 * y, const int ib32, const uint64_t * slm) {
-        return vec_dot_iq2_xs_q8_1(x, y, ib32, slm, slm + 512);
+        return vec_dot_iq2_xs_q8_1(x, y, ib32, slm);
     }
 };
 
 template <> struct moe_iq_traits<GGML_TYPE_IQ3_XXS> {
     using block_t = block_iq3_xxs;
-    static constexpr int table_bytes = 256 * 4 + 128 * 8;
+    static constexpr int table_bytes = 256 * 4;
     static __dpct_inline__ void fill(uint64_t * slm, const int tid, const int nthr) {
         uint32_t * g = (uint32_t *) slm;
         for (int i = tid; i < 256; i += nthr) { g[i] = iq3xxs_grid[i]; }
-        for (int i = tid; i < 128; i += nthr) { slm[128 + i] = ksigns64[i]; }
     }
     static __dpct_inline__ float dot(const block_t * x, const block_q8_1 * y, const int ib32, const uint64_t * slm) {
-        return vec_dot_iq3_xxs_q8_1(x, y, ib32, (const uint32_t *) slm, slm + 128);
+        return vec_dot_iq3_xxs_q8_1(x, y, ib32, (const uint32_t *) slm);
     }
 };
 

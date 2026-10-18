@@ -5851,8 +5851,8 @@ static bool ggml_sycl_mmid_reorder_pending(const ggml_backend_sycl_context * ctx
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
         return false;
     }
-    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K &&
-        src0->type != GGML_TYPE_MXFP4 && !ggml_sycl_mmid_q8_0_reorder_ok(src0)) {
+    if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
+        src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_MXFP4) {
         return false;
     }
     if (src0->type == GGML_TYPE_MXFP4 && (src0->nb[2] % 16 != 0 || (uintptr_t) src0->data % 16 != 0)) {
@@ -6939,11 +6939,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         opt_for_reorder_id(&ctx, src0);
     }
 
-    std::vector<char> ids_host(ggml_nbytes(ids));
-    const char * ids_dev = (const char *) ids->data;
-
-    SYCL_CHECK(CHECK_TRY_ERROR(
-        stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids))));
 
     static const bool route_cache_enabled = ggml_sycl_get_env("GGML_SYCL_MMID_ROUTE_CACHE", 1) != 0;
     ggml_sycl_mmid_route & route = g_ggml_sycl_mmid_routes[ctx.device];

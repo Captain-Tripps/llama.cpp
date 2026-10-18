@@ -1388,6 +1388,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const llama_token id = cur_p->data[0].id;
 
+                    // a token id read back from the backend sampler must be a vocabulary entry: drop the rest of the
+                    // draft instead of aborting when it is not (seen once as a float bit pattern on the SYCL backend)
+                    if (id < 0 || id >= llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)))) {
+                        static int n_warned = 0;
+                        if (n_warned++ < 16) {
+                            LOG_WRN("%s: discarding draft from position %d: invalid token id %d from the draft sampler
+", __func__, i, id);
+                        }
+                        break;
+                    }
+
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
@@ -1406,6 +1417,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
 
                     const llama_token id = cur_p->data[0].id;
+
+                    // a token id read back from the backend sampler must be a vocabulary entry: drop the rest of the
+                    // draft instead of aborting when it is not (seen once as a float bit pattern on the SYCL backend)
+                    if (id < 0 || id >= llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)))) {
+                        static int n_warned = 0;
+                        if (n_warned++ < 16) {
+                            LOG_WRN("%s: discarding draft from position %d: invalid token id %d from the draft sampler
+", __func__, i, id);
+                        }
+                        break;
+                    }
 
                     if (cur_p->data[0].p < params.p_min) {
                         break;

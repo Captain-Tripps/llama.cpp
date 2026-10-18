@@ -30,8 +30,20 @@ void ggml_sycl_op_mul_mat_vec_q(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream);
 
+// Same over per-slice reordered (SoA) weights and quantize_and_reorder_q8_1_soa activations.
+void ggml_sycl_mul_mat_vec_q8_0_grouped_reorder(const void * vx, const void * vy, float * dst, int ncols,
+                                                int nrows_per_group, int ngroups, size_t x_group_stride_bytes,
+                                                size_t y_group_stride_bytes, dpct::queue_ptr stream);
+
+// Grouped plain-layout Q8_0 mat-vec (one activation column per src0 batch), single launch.
+void ggml_sycl_mul_mat_vec_q8_0_grouped(const void * vx, const void * vy, float * dst, int ncols, int nrows_per_group,
+                                        int ngroups, int y_blocks_per_group, dpct::queue_ptr stream);
+
 // Requires standard (non-reorder) block layout for src0.
 // Returns false if src0_type isn't handled; caller should fall back.
+// true when ggml_sycl_mul_mat_vec_q_id() has a kernel for src0_type (it returns false otherwise)
+bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type);
+
 bool ggml_sycl_mul_mat_vec_q_id(
     enum ggml_type     src0_type,
     const void *       vx_base,             // start of stacked expert weights
@@ -44,6 +56,7 @@ bool ggml_sycl_mul_mat_vec_q_id(
     size_t             expert_weight_stride, // bytes between experts in vx_base
     size_t             dst_row_stride,       // bytes between dst rows
     size_t             src1_row_stride,      // 0 = shared src1, else per-expert stride in bytes
+    int                src1_row_div,         // entries sharing one src1 row (1, or n_used per token)
     dpct::queue_ptr    stream);
 
 // Reorder (SoA) variant of the fused MoE expert GEMV.
@@ -61,6 +74,7 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
     size_t             expert_weight_stride,
     size_t             dst_row_stride,
     size_t             src1_row_stride,
+    int                src1_row_div,         // entries sharing one src1 row (1, or n_used per token)
     dpct::queue_ptr    stream);
 
 // Fused dense-FFN GEMV: writes glu(gate . y, up . y) instead of the two mat-vec results.

@@ -306,6 +306,19 @@ struct ggml_sycl_device_info {
 
 const ggml_sycl_device_info & ggml_sycl_info();
 
+// Cross-card pipeline (GGML_SYCL_PIPELINE=1): the submission lock. The GPU driver deadlocks when two host threads
+// append kernel launches concurrently, so a thread holds this lock while it issues work and gives it up while it
+// waits for its card. Both calls are no-ops on threads that do not hold the lock (i.e. always, with the switch off).
+bool ggml_sycl_pipe_unlock();   // returns true if the calling thread held the lock and released it
+void ggml_sycl_pipe_relock();
+struct ggml_sycl_pipe_wait_scope {
+    bool was;
+    ggml_sycl_pipe_wait_scope() : was(ggml_sycl_pipe_unlock()) {}
+    ~ggml_sycl_pipe_wait_scope() { if (was) { ggml_sycl_pipe_relock(); } }
+    ggml_sycl_pipe_wait_scope(const ggml_sycl_pipe_wait_scope &) = delete;
+    ggml_sycl_pipe_wait_scope & operator=(const ggml_sycl_pipe_wait_scope &) = delete;
+};
+
 static constexpr size_t SYCL_BUFFER_ALIGNMENT = 128;
 
 struct ggml_sycl_pool {

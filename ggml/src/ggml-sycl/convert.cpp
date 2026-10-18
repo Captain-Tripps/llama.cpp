@@ -658,6 +658,93 @@ static void convert_unary_sycl(const void * vx, dst_t * y, const int64_t k, dpct
 }
 
 
+// n_slices self-contained reordered Q4_K slices (MoE experts), slice_bytes apart, k weights each -> fp16, one launch.
+void ggml_sycl_dequantize_q4_K_reorder_slices(const void * vx, sycl::half * y, const int64_t k, const size_t slice_bytes,
+                                              const int64_t n_slices, dpct::queue_ptr stream) {
+    const int64_t nb          = k / QK_K;
+    const size_t  local_size  = 32;
+    const size_t  global_size = (size_t) (n_slices * nb) * local_size;
+
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12), cgh);
+
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(local_size)),
+                         [=](sycl::nd_item<1> item_ct1) {
+                             uint8_t *     scales_local = get_pointer(scale_local_acc);
+                             const int64_t g   = item_ct1.get_group(0);
+                             const int64_t e   = g / nb;             // slice
+                             const int64_t i   = g % nb;             // block within the slice
+                             const int64_t tid = item_ct1.get_local_id(0);
+                             const int64_t il  = tid / 8;
+                             const int64_t ir  = tid % 8;
+
+                             sycl::half * yy = y + e * k + i * QK_K + 64 * il + 4 * ir;
+
+                             const uint8_t * base          = static_cast<const uint8_t *>(vx) + (size_t) e * slice_bytes;
+                             const size_t    qs_offset     = i * (QK_K / 2);
+                             const size_t    scales_offset = nb * (QK_K / 2) + i * K_SCALE_SIZE;
+                             const size_t    dm_offset     = nb * (QK_K / 2) + nb * K_SCALE_SIZE + i * sizeof(ggml_half2);
+
+                             const uint8_t *  qs_ptr     = base + qs_offset;
+                             const uint8_t *  scales_ptr = base + scales_offset;
+                             const ggml_half2 dm_values  = *reinterpret_cast<const ggml_half2 *>(base + dm_offset);
+
+                             const float dall = dm_values.x();
+                             const float dmin = dm_values.y();
+
+                             if (tid < 12) {
+                                 scales_local[tid] = scales_ptr[tid];
+                             }
+
+                             item_ct1.barrier(sycl::access::fence_space::local_space);
+                             dequantize_q4_K_common(yy, qs_ptr, dall, dmin, scales_local, il, ir);
+                         });
+    });
+}
+
+// Selected Q4_K slices retain their dense expert slots in the output buffer.
+void ggml_sycl_dequantize_q4_K_reorder_indexed_slices(const void * vx, sycl::half * y, const int64_t k,
+    const size_t slice_bytes, const int64_t * slice_ids, const int64_t n_slices,
+    const int64_t output_first, dpct::queue_ptr stream) {
+    const int64_t nb = k / QK_K;
+    const size_t local_size = 32;
+    const size_t global_size = (size_t)(n_slices * nb) * local_size;
+
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(local_size)),
+            [=](sycl::nd_item<1> item_ct1) {
+                uint8_t * scales_local = get_pointer(scale_local_acc);
+                const int64_t g = item_ct1.get_group(0);
+                const int64_t active = g / nb;
+                const int64_t i = g % nb;
+                const int64_t expert = slice_ids[active];
+                const int64_t tid = item_ct1.get_local_id(0);
+                const int64_t il = tid / 8;
+                const int64_t ir = tid % 8;
+                sycl::half * yy = y + (expert - output_first) * k + i * QK_K + 64 * il + 4 * ir;
+
+                const uint8_t * base = static_cast<const uint8_t *>(vx) + (size_t)expert * slice_bytes;
+                const size_t qs_offset = i * (QK_K / 2);
+                const size_t scales_offset = nb * (QK_K / 2) + i * K_SCALE_SIZE;
+                const size_t dm_offset = nb * (QK_K / 2) + nb * K_SCALE_SIZE + i * sizeof(ggml_half2);
+                const uint8_t * qs_ptr = base + qs_offset;
+                const uint8_t * scales_ptr = base + scales_offset;
+                const ggml_half2 dm_values = *reinterpret_cast<const ggml_half2 *>(base + dm_offset);
+                const float dall = dm_values.x();
+                const float dmin = dm_values.y();
+                if (tid < 12) {
+                    scales_local[tid] = scales_ptr[tid];
+                }
+                item_ct1.barrier(sycl::access::fence_space::local_space);
+                dequantize_q4_K_common(yy, qs_ptr, dall, dmin, scales_local, il, ir);
+            });
+    });
+}
+
 to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
     switch (type) {
         case GGML_TYPE_Q1_0:

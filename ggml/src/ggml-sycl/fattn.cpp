@@ -154,10 +154,17 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     const bool glm_mla_shape = Q->ne[0] == 576 && K->ne[0] == 576 &&
         V->ne[0] == 512 && gqa_ratio == 20 &&
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+    // sinks: one f32 value per query head, applied in the MKL normalize step (GGML_SYCL_MKL_FA_SINKS=1)
+    static const bool mkl_fa_sinks = ggml_sycl_get_env("GGML_SYCL_MKL_FA_SINKS", 0) != 0;
+    // test hooks: lower the size gates so test-backend-ops reaches the MKL path with small cases
+    static const int mkl_fa_min_q  = ggml_sycl_get_env("GGML_SYCL_MKL_FA_MIN_Q", 32);
+    static const int mkl_fa_min_kv = ggml_sycl_get_env("GGML_SYCL_MKL_FA_MIN_KV", 1024);
+    const bool sinks_ok = !sinks || (mkl_fa_sinks && sinks->type == GGML_TYPE_F32 && sinks->ne[0] == Q->ne[2] &&
+                                     sinks->nb[0] == sizeof(float));
 
-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
+    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && sinks_ok && gqa_ratio >= 2 &&
         (standard_shape || glm_mla_shape) &&
-        Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
+        Q->ne[1] >= mkl_fa_min_q && K->ne[1] >= mkl_fa_min_kv &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
         (Q->ne[3] == K->ne[3] || K->ne[3] == 1)) {
         // F16 K/V strides must be a multiple of ne[0]*2 (the natural row size
@@ -315,6 +322,30 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
                 fa_call_seq, kname, Dk,
                 (long long)cur_nkv, (long long)delta,
                 (long long)V_dbg->ne[1]);
+    }
+
+    // GGML_SYCL_FA_SHAPE_DEBUG=1: shapes of the first prompt-batch calls, to see which fast-path gate fails
+    static int fa_shape_debug = ggml_sycl_get_env("GGML_SYCL_FA_SHAPE_DEBUG", 0);
+    static int fa_shape_count = 0;
+    if (fa_shape_debug == 1 && dst->src[0]->ne[1] >= 32 && fa_shape_count < 16) {
+        fa_shape_count++;
+        float bias_dbg = 0.0f, softcap_dbg = 0.0f;
+        memcpy(&bias_dbg, (const float *) dst->op_params + 1, sizeof(float));
+        memcpy(&softcap_dbg, (const float *) dst->op_params + 2, sizeof(float));
+        const char * names[5] = { "Q", "K", "V", "mask", "sinks" };
+        for (int s = 0; s < 5; ++s) {
+            const ggml_tensor * t = dst->src[s];
+            if (t == nullptr) {
+                fprintf(stderr, "[FA-SHAPE] %s: none\n", names[s]);
+                continue;
+            }
+            fprintf(stderr, "[FA-SHAPE] %s: type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] op=%s\n", names[s], ggml_type_name(t->type),
+                    (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                    t->nb[0], t->nb[1], t->nb[2], t->nb[3], ggml_op_name(t->op));
+        }
+        fprintf(stderr, "[FA-SHAPE] dst ne=[%lld,%lld,%lld,%lld] max_bias=%g softcap=%g kernel=%d\n",
+                (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                bias_dbg, softcap_dbg, (int) ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst));
     }
 
     const best_fattn_kernel fk = ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst);

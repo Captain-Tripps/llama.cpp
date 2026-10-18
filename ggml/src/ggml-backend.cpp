@@ -1797,8 +1797,21 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
-        for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
+        //
+        // With the SYCL cross-card pipeline (GGML_SYCL_PIPELINE=1) every access to a card's memory (graphs, writes,
+        // reads, card-to-card copies) runs on that card's queue in submission order with the addresses it was issued
+        // with, and freeing a buffer drains its card. A new layout therefore cannot disturb work that is still queued,
+        // and waiting here would put the cards back in lockstep for every model whose batch graph changes size.
+        // GGML_SYCL_PIPELINE_REALLOC_SYNC=1 restores the wait.
+        static const bool backend_orders_memory = [] {
+            const char * v = getenv("GGML_SYCL_PIPELINE");
+            const char * w = getenv("GGML_SYCL_PIPELINE_REALLOC_SYNC");
+            return v != nullptr && atoi(v) != 0 && !(w != nullptr && atoi(w) != 0);
+        }();
+        if (!backend_orders_memory) {
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
         }
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {

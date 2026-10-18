@@ -213,6 +213,8 @@ static void mkl_fa_normalize_head(
     float * __restrict dst_batch,
     const float * __restrict VKQ_accum,
     const float * __restrict KQ_sum,
+    const float * __restrict KQ_max,
+    const float * __restrict sinks,
     int iqh, int n_queries, int DV, int n_q_heads,
     int64_t src_offset, int64_t wg_size) {
 
@@ -226,6 +228,14 @@ static void mkl_fa_normalize_head(
 
                 int     ksum_idx = (int)(src_offset / DV) + jc;
                 float   inv_sum  = 1.0f / KQ_sum[ksum_idx];
+                if (sinks) {
+                    // the sink of this head joins the softmax denominator, as in the TILE/VEC kernels
+                    const float sink    = sinks[iqh];
+                    const float old_max = KQ_max[ksum_idx];
+                    const float new_max = sycl::fmax(old_max, sink);
+                    const float rescale = sycl::native::exp(old_max - new_max);
+                    inv_sum = rescale / (KQ_sum[ksum_idx] * rescale + sycl::native::exp(sink - new_max));
+                }
                 const float * __restrict src = VKQ_accum
                     + src_offset + jc * (int64_t)DV;
                 // Interleaved dst layout (matching TILE):
@@ -367,7 +377,9 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
     ggml_tensor * KQV = dst;
+    const float * sinks_ptr = sinks ? (const float *) sinks->data : nullptr;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -564,7 +576,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 n_query_rows, DV, wg_size);
 
             // Sync before MKL GEMM (MKL may use an internal queue)
-            stream->wait();
+            { ggml_sycl_pipe_wait_scope ws_; stream->wait(); }
 
             // 3. KV chunk loop (OUTER): dequant each chunk once, then tile queries.
             for (int chunk_start = 0; chunk_start < n_kv; chunk_start += chunk_size) {
@@ -579,7 +591,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                         mkl_fa_dequant_chunk(stream, V_desc, KQV,
                             V_chunk_f16_ptr, ikvh, chunk_start, this_chunk);
                     }
-                    stream->wait();  // dequant must be ready before MKL GEMM
+                    { ggml_sycl_pipe_wait_scope ws_; stream->wait(); }  // dequant must be ready before MKL GEMM
                     MKL_ACCUM(dequant_time_us, t0);
                 }
 
@@ -598,7 +610,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             Q_head_f16_ptr + (int64_t)q0 * DKQ, DKQ,
                             beta,
                             KQ_f32_ptr, this_chunk);
-                        try { ev.wait_and_throw(); } catch (sycl::exception & e) {
+                        try { ggml_sycl_pipe_wait_scope ws_; ev.wait_and_throw(); } catch (sycl::exception & e) {
                             GGML_LOG_INFO("[MKL-FA] GEMM KQ: %s\n", e.what());
                             GGML_ABORT("MKL GEMM KQ failed");
                         }
@@ -616,7 +628,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             mask_batch, mask_head_stride,
                             mask_row_stride, mask_n_heads,
                             logit_softcap, wg_size);
-                        stream->wait();  // S_f16 must be ready for GEMM
+                        { ggml_sycl_pipe_wait_scope ws_; stream->wait(); }  // S_f16 must be ready for GEMM
                         MKL_ACCUM(softmax_time_us, t0);
                     }
 
@@ -631,7 +643,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             S_f16_ptr, this_chunk,
                             beta,
                             VKQ_chunk_ptr, DV);
-                        try { ev.wait_and_throw(); } catch (sycl::exception & e) {
+                        try { ggml_sycl_pipe_wait_scope ws_; ev.wait_and_throw(); } catch (sycl::exception & e) {
                             GGML_LOG_INFO("[MKL-FA] GEMM VKQ: %s\n", e.what());
                             GGML_ABORT("MKL GEMM VKQ failed");
                         }
@@ -662,6 +674,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 int64_t src_offset = (int64_t)iqg * n_queries * DV;
                 mkl_fa_normalize_head(stream,
                     dst_batch, VKQ_accum_ptr, KQ_sum_ptr,
+                    KQ_max_ptr, sinks_ptr,
                     iqh, n_queries, DV, n_q_heads,
                     src_offset, wg_size);
             }

@@ -219,11 +219,14 @@ struct dsv4_state_tensors {
     ggml_tensor * score;
 };
 
+// pin(t): names the row gather so that the context can place it on the card of layer il (see graph_get_cb)
+template <typename F>
 static dsv4_state_tensors dsv4_build_state_restore(
         ggml_context * ctx,
         const llm_graph_input_dsv4::comp_input & inp,
         const llama_dsv4_comp_state * state,
-        int32_t il) {
+        int32_t il,
+        F && pin) {
     dsv4_state_tensors restored = {
         state->get_kv_all(ctx, il),
         state->get_score_all(ctx, il),
@@ -234,9 +237,11 @@ static dsv4_state_tensors dsv4_build_state_restore(
     }
 
     ggml_tensor * kv_rows = ggml_get_rows(ctx, restored.kv, inp.state_restore_src_idxs);
+    pin(kv_rows);
     restored.kv = state->cpy_kv(ctx, kv_rows, inp.state_restore_dst_idxs, il);
 
     ggml_tensor * score_rows = ggml_get_rows(ctx, restored.score, inp.state_restore_src_idxs);
+    pin(score_rows);
     restored.score = state->cpy_score(ctx, score_rows, inp.state_restore_dst_idxs, il);
 
     return restored;
@@ -973,7 +978,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
         const auto * csa_state = inp_dsv4->mctx->get_csa_state();
         const dsv4_state_tensors csa_restored = dsv4_build_state_restore(
-                ctx0, inp_dsv4->get_csa(), csa_state, il);
+                ctx0, inp_dsv4->get_csa(), csa_state, il, [&](ggml_tensor * t) { cb(t, "state_restore_rows", il); });
         ggml_tensor * csa_base_kv = dsv4_view_2d(
                 ctx0, csa_restored.kv, csa_restored.kv->ne[0], csa_state->get_n_rows(), 0);
         ggml_tensor * csa_base_score = dsv4_view_2d(
@@ -1042,7 +1047,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
         const auto * lid_state = inp_dsv4->mctx->get_lid_state();
         const dsv4_state_tensors lid_restored = dsv4_build_state_restore(
-                ctx0, inp_dsv4->get_lid(), lid_state, il);
+                ctx0, inp_dsv4->get_lid(), lid_state, il, [&](ggml_tensor * t) { cb(t, "state_restore_rows", il); });
         ggml_tensor * lid_base_kv = dsv4_view_2d(
                 ctx0, lid_restored.kv, lid_restored.kv->ne[0], lid_state->get_n_rows(), 0);
         ggml_tensor * lid_base_score = dsv4_view_2d(
@@ -1103,7 +1108,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         GGML_ASSERT(hca_state_score);
 
         hca_state = inp_dsv4->mctx->get_hca_state();
-        hca_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_hca(), hca_state, il);
+        hca_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_hca(), hca_state, il, [&](ggml_tensor * t) { cb(t, "state_restore_rows", il); });
         ggml_tensor * hca_base_kv = dsv4_view_2d(
                 ctx0, hca_restored.kv, hca_restored.kv->ne[0], hca_state->get_n_rows(), 0);
         ggml_tensor * hca_base_score = dsv4_view_2d(
@@ -1139,7 +1144,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
             hca_state = inp_dsv4->mctx->get_hca_state();
         }
         if (hca_restored.kv == nullptr) {
-            hca_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_hca(), hca_state, il);
+            hca_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_hca(), hca_state, il, [&](ggml_tensor * t) { cb(t, "state_restore_rows", il); });
         }
         if (hca_source_kv == nullptr || hca_source_score == nullptr) {
             ggml_tensor * hca_base_kv = dsv4_view_2d(

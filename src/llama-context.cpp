@@ -1524,7 +1524,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
+        // With the SYCL cross-card pipeline (GGML_SYCL_PIPELINE=1) the backend keeps that order itself: a write to a
+        // card that still has queued work is queued behind it with its own copy of the data. Waiting here would put
+        // the cards back in lockstep for every model whose batch graph is reusable.
+        static const bool backend_orders_inputs = [] {
+            const char * v = getenv("GGML_SYCL_PIPELINE");
+            const char * w = getenv("GGML_SYCL_PIPELINE_REUSE_SYNC");
+            return v != nullptr && atoi(v) != 0 && !(w != nullptr && atoi(w) != 0);
+        }();
+        if (cparams.pipeline_parallel && !backend_orders_inputs) {
             ggml_backend_sched_synchronize(sched.get());
         }
 
@@ -2856,7 +2864,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
+            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0 || strcmp(name, "state_restore_rows") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {

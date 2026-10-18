@@ -157,7 +157,7 @@ static constexpr int dsv4_hc_post_block_size = 256;
 
 // comb == nullptr is identity mixing: each destination stream keeps its own residual
 // instead of summing across the streams.
-template <bool has_comb>
+template <bool has_comb, bool gated>
 static void dsv4_hc_post_f32_sycl(
         const float * x, const float * residual, const float * post, const float * comb, float * dst,
         int64_t n_embd, int64_t hc, int64_t n_tokens,
@@ -166,7 +166,7 @@ static void dsv4_hc_post_f32_sycl(
         int64_t sp0, int64_t sp1,
         int64_t sc0, int64_t sc1, int64_t sc2,
         int64_t sd0, int64_t sd1, int64_t sd2,
-        queue_ptr stream) {
+        float scale_in, float scale_out, queue_ptr stream) {
     const int64_t nr = n_embd * hc * n_tokens;
     const int64_t block_size = dsv4_hc_post_block_size;
     const int64_t num_blocks = (nr + block_size - 1) / block_size;
@@ -183,7 +183,11 @@ static void dsv4_hc_post_f32_sycl(
             const int64_t idst = (ir / n_embd) % hc;
             const int64_t it   = ir / (n_embd * hc);
 
-            float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
+            float gate = post[idst*sp0 + it*sp1];
+            if constexpr (gated) {
+                gate = scale_out / (1.0f + sycl::exp(-gate * scale_in));
+            }
+            float sum = x[i0*sx0 + it*sx1] * gate;
             if constexpr (has_comb) {
                 for (int64_t isrc = 0; isrc < hc; ++isrc) {
                     sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
@@ -284,11 +288,11 @@ void ggml_sycl_op_dsv4_hc_comb(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             eps, n_iter, stream);
 }
 
-void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * gate_input, float scale_in, float scale_out) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
-    const ggml_tensor * post     = dst->src[2];
+    const ggml_tensor * post     = gate_input ? gate_input : dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
@@ -317,8 +321,8 @@ void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * ds
 
     queue_ptr stream = ctx.stream();
 
-    const auto launch = [&](auto has_comb) {
-        dsv4_hc_post_f32_sycl<decltype(has_comb)::value>(
+    const auto launch = [&](auto has_comb, auto gated) {
+        dsv4_hc_post_f32_sycl<decltype(has_comb)::value, decltype(gated)::value>(
             (const float *) x->data, (const float *) residual->data,
             (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
             n_embd, hc, n_tokens,
@@ -327,12 +331,14 @@ void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
-            stream);
+            scale_in, scale_out, stream);
     };
 
-    if (comb) {
-        launch(std::true_type{});
+    if (gate_input) {
+        if (comb) { launch(std::true_type{}, std::true_type{}); }
+        else      { launch(std::false_type{}, std::true_type{}); }
     } else {
-        launch(std::false_type{});
+        if (comb) { launch(std::true_type{}, std::false_type{}); }
+        else      { launch(std::false_type{}, std::false_type{}); }
     }
 }

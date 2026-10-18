@@ -388,6 +388,10 @@ template <> struct reorder_vec_dot_shared_weights<GGML_TYPE_Q5_K> {
     static constexpr bool value = true;
 };
 
+template <> struct reorder_vec_dot_shared_weights<GGML_TYPE_Q6_K> {
+    static constexpr bool value = true;
+};
+
 template <ggml_type T> struct reorder_vec_dot_shared_activations {
     static constexpr bool value = false;
 };
@@ -799,40 +803,96 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
     using q6_k_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q6_K>;
     using q6_k_traits = typename q6_k_block::traits;
 
-    __dpct_inline__ float vec_dot_q6_K_q8_1_impl_mmvq(const int vl, const int vh, const int * __restrict__ u,
-                                                      const int8_t * __restrict__ scales, const float d,
-                                                      const float * __restrict__ d8) {
-        return vec_dot_q6_K_q8_1_impl_mmvq_scalar(
-            vl, vh, u[0], u[1], scales[0], scales[4], d, d8[0], d8[1]);
+    // r65: the weight side does not depend on the destination column, so a multi-column call (MTP / draft verify
+    // batches of 2..8 columns) unpacks the 6-bit weights once and applies them to every column's activations.
+    // vdr_mmvq == 2: a call covers ints iqs and iqs+1 (iqs even), whose ql / qh / q8_1 ints are consecutive and share
+    // scales, high-bit shift and q8_1 block, so each stream is one 8-byte load.
+    struct weights {
+        int   vi0[2];   // signed 6-bit weights of the low nibbles (4 x int8 per int)
+        int   vi1[2];   // signed 6-bit weights of the high nibbles
+        int   sc0;
+        int   sc1;
+        float d;
+    };
+
+    struct activations {
+        int   u0[2];
+        int   u1[2];
+        float d80;
+        float d81;
+    };
+
+    __dpct_inline__ static weights load(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                        const std::pair<int, int> d_offset, const int & iqs) {
+        const uint8_t *   base   = static_cast<const uint8_t *>(vbq);
+        const uint8_t *   ql     = base + ibx_offset.first;
+        const uint8_t *   qh     = base + ibx_offset.second;
+        const int8_t *    scales = reinterpret_cast<const int8_t *>(base + d_offset.first);
+        const ggml_half * dptr   = (const ggml_half *) (base + d_offset.second);
+
+        const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
+        const int vh_shift     = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+        const int qh_index     = (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4);
+
+        const sycl::int2 vl2 = *reinterpret_cast<const sycl::int2 *>(ql + sizeof(int) * iqs);
+        const sycl::int2 vh2 = *reinterpret_cast<const sycl::int2 *>(qh + sizeof(int) * qh_index);
+
+        weights w;
+        const int vl[2] = { vl2.x(), vl2.y() };
+        const int vh[2] = { vh2.x() >> vh_shift, vh2.y() >> vh_shift };
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int vil0 = (vl[k] >> 0) & 0x0F0F0F0F;
+            const int vih0 = ((vh[k] >> 0) << 4) & 0x30303030;
+            w.vi0[k] = byte_sub_4(vil0 | vih0, 0x20202020);
+            const int vil1 = (vl[k] >> 4) & 0x0F0F0F0F;
+            const int vih1 = ((vh[k] >> 4) << 4) & 0x30303030;
+            w.vi1[k] = byte_sub_4(vil1 | vih1, 0x20202020);
+        }
+        const int8_t * scs = scales + scale_offset;
+        w.sc0 = scs[0];
+        w.sc1 = scs[4];
+        w.d   = *dptr;
+        return w;
+    }
+
+    __dpct_inline__ static activations load_activations(const int8_t * __restrict__ q8_1_quant_ptr,
+                                                        const sycl::half2 * __restrict__ q8_1_ds, const int & iqs) {
+        const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
+        const sycl::int2 u0 = *reinterpret_cast<const sycl::int2 *>(
+            q8_1_quant_ptr + bq8_offset * QK8_1 + sizeof(int) * (iqs % QI8_1));
+        const sycl::int2 u1 = *reinterpret_cast<const sycl::int2 *>(
+            q8_1_quant_ptr + (bq8_offset + 2) * QK8_1 + sizeof(int) * (iqs % QI8_1));
+        activations a;
+        a.u0[0] = u0.x(); a.u0[1] = u0.y();
+        a.u1[0] = u1.x(); a.u1[1] = u1.y();
+        a.d80 = (*(q8_1_ds + bq8_offset + 0))[0];
+        a.d81 = (*(q8_1_ds + bq8_offset + 2))[0];
+        return a;
+    }
+
+    // same expression and accumulation order as the per-int scalar kernel, summed over the two ints
+    __dpct_inline__ static float apply(const weights & w, const activations & a) {
+        float r = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const float sumf = a.d80 * (dpct::dp4a(w.vi0[k], a.u0[k], 0) * w.sc0) +
+                               a.d81 * (dpct::dp4a(w.vi1[k], a.u1[k], 0) * w.sc1);
+            r += w.d * sumf;
+        }
+        return r;
+    }
+
+    __dpct_inline__ static float dot(const weights & w, const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
+                                     const int & iqs) {
+        const auto a = load_activations(q8_1_quant_ptr, q8_1_ds, iqs);
+        return apply(w, a);
     }
 
     __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
                      const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
                      const int iqs) {
-        const uint8_t *   base   = static_cast<const uint8_t *>(vbq);
-        const uint8_t *   ql     = base + ibx_offset.first;
-        const uint8_t *   qh     = base + ibx_offset.second;
-        const int8_t *    scales = reinterpret_cast<const int8_t *>(base + d_offset.first);
-        const ggml_half * d      = (const ggml_half *) (base + d_offset.second);
-
-        const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
-        const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
-        const int vh_shift     = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
-
-        const int vl = get_int_from_uint8(ql, iqs);
-        const int vh = get_int_from_uint8(qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
-
-        const int8_t * scs = scales + scale_offset;
-
-        const int u0 = get_int_from_int8_aligned(
-            q8_1_quant_ptr + bq8_offset * QK8_1, iqs % QI8_1);
-        const int u1 = get_int_from_int8_aligned(
-            q8_1_quant_ptr + (bq8_offset + 2) * QK8_1, iqs % QI8_1);
-        const float d80 = (*(q8_1_ds + bq8_offset + 0))[0];
-        const float d81 = (*(q8_1_ds + bq8_offset + 2))[0];
-
-        return vec_dot_q6_K_q8_1_impl_mmvq_scalar(
-            vl, vh, u0, u1, scs[0], scs[4], *d, d80, d81);
+        return dot(load(vbq, ibx_offset, d_offset, iqs), q8_1_quant_ptr, q8_1_ds, iqs);
     }
 };
 

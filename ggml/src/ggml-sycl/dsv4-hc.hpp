@@ -5,6 +5,6 @@
 
 void ggml_sycl_op_dsv4_hc_pre(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 void ggml_sycl_op_dsv4_hc_comb(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
-void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * gate_input = nullptr, float scale_in = 1.0f, float scale_out = 1.0f);
 
 #endif // GGML_SYCL_DSV4_HC_HPP

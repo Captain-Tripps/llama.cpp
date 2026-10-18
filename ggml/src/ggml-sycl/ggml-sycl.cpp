@@ -10063,13 +10063,16 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 case GGML_GLU_OP_REGLU:
                 case GGML_GLU_OP_GEGLU:
                 case GGML_GLU_OP_SWIGLU:
-                case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
                     // the fused GLU kernels only have f32/f16 instantiations
                     return ggml_is_contiguous_1(op->src[0]) &&
                            (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+                case GGML_GLU_OP_SWIGLU_OAI:
+                    // ggml_sycl_op_swiglu_oai asserts f32 (an f16 request aborted test-backend-ops)
+                    return ggml_is_contiguous_1(op->src[0]) && op->type == GGML_TYPE_F32 &&
+                           op->src[0]->type == GGML_TYPE_F32;
                 default:
                     return false;
             }

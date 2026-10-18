@@ -235,6 +235,33 @@ void ggml_print_backtrace(void) {
         waitpid(child_pid, NULL, 0);
     }
 }
+#elif defined(_WIN32) && defined(GGML_WIN_BACKTRACE)
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+void ggml_print_backtrace(void) {
+    // debug aid (GGML_WIN_BACKTRACE builds only): symbolized stack via dbghelp + PDBs
+    HANDLE proc = GetCurrentProcess();
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(proc, NULL, TRUE);
+    void * frames[64];
+    const USHORT n = RtlCaptureStackBackTrace(1, 64, frames, NULL);
+    char buf[sizeof(SYMBOL_INFO) + 512];
+    SYMBOL_INFO * sym = (SYMBOL_INFO *) buf;
+    for (USHORT i = 0; i < n; ++i) {
+        memset(buf, 0, sizeof(buf));
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen   = 511;
+        DWORD64 disp = 0;
+        IMAGEHLP_LINE64 line = { sizeof(IMAGEHLP_LINE64) };
+        DWORD ldisp = 0;
+        const DWORD64 a = (DWORD64) (uintptr_t) frames[i];
+        const BOOL hs = SymFromAddr(proc, a, &disp, sym);
+        const BOOL hl = SymGetLineFromAddr64(proc, a, &ldisp, &line);
+        fprintf(stderr, "  #%02u %s +0x%llx  %s:%lu\n", i, hs ? sym->Name : "?", (unsigned long long) disp,
+                hl ? line.FileName : "?", hl ? (unsigned long) line.LineNumber : 0ul);
+    }
+    fflush(stderr);
+}
 #else
 void ggml_print_backtrace(void) {
     // platform not supported

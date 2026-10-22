@@ -10756,20 +10756,19 @@ struct ggml_backend_sycl_comm_context {
 
     // pinned host staging per device context, reused across calls (queues are in-order)
     uint8_t * host_out[2] = { nullptr, nullptr };
-    uint8_t * host_in[2]  = { nullptr, nullptr };
     size_t    host_bytes  = 0;
 
     void free_host() {
         for (int i = 0; i < 2; ++i) {
             const sycl::context sctx = ((ggml_backend_sycl_context *) backends[i]->context)->stream()->get_context();
             if (host_out[i]) { sycl::free(host_out[i], sctx); host_out[i] = nullptr; }
-            if (host_in[i])  { sycl::free(host_in[i],  sctx); host_in[i]  = nullptr; }
         }
         host_bytes = 0;
     }
 };
 
-// dst0 <- src1 and dst1 <- src0 through pinned host memory, with a single host wait
+// dst0 <- src1 and dst1 <- src0 through pinned host memory (PR #30956: each queue uploads straight from the
+// other device's staging buffer, no CPU memcpy; blocking on the uploads so host_out can be reused next call)
 static void ggml_sycl_comm_exchange(ggml_backend_sycl_comm_context * comm, queue_ptr q0, queue_ptr q1,
                                     void * dst0, const void * src1, void * dst1, const void * src0,
                                     size_t nbytes) {
@@ -10778,10 +10777,8 @@ static void ggml_sycl_comm_exchange(ggml_backend_sycl_comm_context * comm, queue
         { ggml_sycl_pipe_wait_scope ws_; q1->wait(); }
         comm->free_host();
         comm->host_out[0] = sycl::malloc_host<uint8_t>(nbytes, q0->get_context());
-        comm->host_in[0]  = sycl::malloc_host<uint8_t>(nbytes, q0->get_context());
         comm->host_out[1] = sycl::malloc_host<uint8_t>(nbytes, q1->get_context());
-        comm->host_in[1]  = sycl::malloc_host<uint8_t>(nbytes, q1->get_context());
-        GGML_ASSERT(comm->host_out[0] && comm->host_in[0] && comm->host_out[1] && comm->host_in[1]);
+        GGML_ASSERT(comm->host_out[0] && comm->host_out[1]);
         comm->host_bytes = nbytes;
     }
 
@@ -10789,10 +10786,10 @@ static void ggml_sycl_comm_exchange(ggml_backend_sycl_comm_context * comm, queue
     sycl::event e1 = q1->memcpy(comm->host_out[1], src1, nbytes);
     { ggml_sycl_pipe_wait_scope ws_; e0.wait(); }
     { ggml_sycl_pipe_wait_scope ws_; e1.wait(); }
-    std::memcpy(comm->host_in[0], comm->host_out[1], nbytes);
-    std::memcpy(comm->host_in[1], comm->host_out[0], nbytes);
-    q0->memcpy(dst0, comm->host_in[0], nbytes);
-    q1->memcpy(dst1, comm->host_in[1], nbytes);
+    sycl::event u0 = q0->memcpy(dst0, comm->host_out[1], nbytes);
+    sycl::event u1 = q1->memcpy(dst1, comm->host_out[0], nbytes);
+    { ggml_sycl_pipe_wait_scope ws_; u0.wait(); }
+    { ggml_sycl_pipe_wait_scope ws_; u1.wait(); }
 }
 
 void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends) try {

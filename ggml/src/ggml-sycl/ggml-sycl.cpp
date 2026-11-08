@@ -10884,7 +10884,23 @@ static bool ggml_sycl_comm_allreduce_nway(ggml_backend_sycl_comm_context * comm,
         const char * s = getenv("GGML_SYCL_COMM_RS");
         return s == nullptr || atoi(s) != 0;
     }();
-    if (use_bf16 && rs_enabled) {
+    // GGML_SYCL_COMM_P2P=1: copy partials card to card instead of through host memory. Only possible when all
+    // queues share one SYCL context (true on the Zeus Windows runtime by default); otherwise falls back.
+    static const bool p2p_requested = [] {
+        const char * s = getenv("GGML_SYCL_COMM_P2P");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    bool p2p = p2p_requested;
+    for (int j = 1; j < n && p2p; ++j) {
+        p2p = q[j]->get_context() == q[0]->get_context();
+    }
+    static bool p2p_logged = false;
+    if (p2p_requested && !p2p_logged) {
+        GGML_LOG_INFO("%s: GGML_SYCL_COMM_P2P=1 -> %s\n", __func__, p2p ? "direct peer copies (shared context)" : "host staging (contexts differ)");
+        p2p_logged = true;
+    }
+
+    if (use_bf16 && rs_enabled && !p2p) {
         auto cbeg = [&](int c) { return (int64_t) c * nelem / n; };
         std::vector<sycl::event> evs;
         evs.reserve((size_t) n * (n - 1));
@@ -11014,8 +11030,17 @@ static bool ggml_sycl_comm_allreduce_nway(ggml_backend_sycl_comm_context * comm,
 
     std::vector<sycl::event> ev;
     ev.reserve((size_t) n * (n - 1));
-    for (int j = 0; j < n; ++j) {
-        ev.push_back(q[j]->memcpy(comm->host_out[j], send[j], xbytes));
+    if (p2p) {
+        // direct device-to-device copies inside the shared context: host waits for each card's own work
+        // (self barrier, no cross-queue wait list), then every card pulls the others' partials straight
+        // from their device memory
+        for (int j = 0; j < n; ++j) {
+            ev.push_back(q[j]->ext_oneapi_submit_barrier());
+        }
+    } else {
+        for (int j = 0; j < n; ++j) {
+            ev.push_back(q[j]->memcpy(comm->host_out[j], send[j], xbytes));
+        }
     }
     for (auto & e : ev) {
         ggml_sycl_pipe_wait_scope ws_;
@@ -11029,7 +11054,7 @@ static bool ggml_sycl_comm_allreduce_nway(ggml_backend_sycl_comm_context * comm,
                 continue;
             }
             const int slot = c < j ? c : c - 1;
-            ev.push_back(q[j]->memcpy(inbox[j] + (size_t) slot * xbytes, comm->host_out[c], xbytes));
+            ev.push_back(q[j]->memcpy(inbox[j] + (size_t) slot * xbytes, p2p ? send[c] : comm->host_out[c], xbytes));
         }
     }
     for (auto & e : ev) {

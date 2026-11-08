@@ -10875,6 +10875,125 @@ static bool ggml_sycl_comm_allreduce_nway(ggml_backend_sycl_comm_context * comm,
         comm->host_bytes = xbytes;
     }
 
+    // Large BF16 tensors (prompt batches): reduce-scatter + all-gather. Card j sums only chunk j
+    // (1/N of the elements) and then shares it, so each card uploads 2*(N-1)/N tensors' worth of BF16
+    // instead of N-1, at the cost of one more host wait. Chunk j is summed on card j alone, so the other
+    // cards receive it as BF16 while card j keeps FP32 (low-bit differences, as on the BF16 path above).
+    // GGML_SYCL_COMM_RS=0 keeps the all-to-all path for every size.
+    static const bool rs_enabled = [] {
+        const char * s = getenv("GGML_SYCL_COMM_RS");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    if (use_bf16 && rs_enabled) {
+        auto cbeg = [&](int c) { return (int64_t) c * nelem / n; };
+        std::vector<sycl::event> evs;
+        evs.reserve((size_t) n * (n - 1));
+        auto wait_all = [&]() {
+            for (auto & e : evs) {
+                ggml_sycl_pipe_wait_scope ws_;
+                e.wait();
+            }
+            evs.clear();
+        };
+        // device scratch on card j: [outbox: nelem bf16][inbox: (N-1) slots of ceil(nelem/N) bf16][red: ceil(nelem/N) bf16]
+        const int64_t cmax = (nelem + n - 1) / n;
+        std::vector<uint16_t *> outbox(n), inb(n), red(n);
+        for (int j = 0; j < n; ++j) {
+            uint16_t * b = (uint16_t *) comm->bufs[j]->get();
+            outbox[j] = b;
+            inb[j]    = b + nelem;
+            red[j]    = inb[j] + (size_t) (n - 1) * cmax;
+            const float * part = (const float *) tensors[j]->data;
+            uint16_t *    ob   = outbox[j];
+            q[j]->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
+                ob[i] = (uint16_t) (sycl::bit_cast<uint32_t>(part[i]) >> 16);
+            });
+            evs.push_back(q[j]->memcpy(comm->host_out[j], ob, xbytes));
+        }
+        wait_all();
+
+        // reduce-scatter: card j gathers chunk j of every other card's partial
+        for (int j = 0; j < n; ++j) {
+            const int64_t b0 = cbeg(j), len = cbeg(j + 1) - b0;
+            for (int c = 0; c < n; ++c) {
+                if (c == j || len == 0) {
+                    continue;
+                }
+                const int slot = c < j ? c : c - 1;
+                evs.push_back(q[j]->memcpy(inb[j] + (size_t) slot * cmax,
+                                           (const uint16_t *) comm->host_out[c] + b0, len * sizeof(uint16_t)));
+            }
+        }
+        wait_all();
+
+        // sum chunk j in card order, keep FP32 locally, publish it as BF16 in host_out[j] (same region it came from;
+        // every upload reading host_out has finished)
+        for (int j = 0; j < n; ++j) {
+            const int64_t b0 = cbeg(j), len = cbeg(j + 1) - b0;
+            if (len == 0) {
+                continue;
+            }
+            float *          own = (float *) tensors[j]->data + b0;
+            const uint16_t * in  = inb[j];
+            uint16_t *       rd  = red[j];
+            const int        self = j;
+            const int        nn   = n;
+            const int64_t    cm   = cmax;
+            q[j]->parallel_for(sycl::range<1>(len), [=](sycl::id<1> id) {
+                const int64_t i = id[0];
+                float acc = 0.0f;
+                for (int c = 0; c < nn; ++c) {
+                    if (c == self) {
+                        acc += own[i];
+                    } else {
+                        const int64_t slot = c < self ? c : c - 1;
+                        acc += sycl::bit_cast<float>(((uint32_t) in[slot * cm + i]) << 16);
+                    }
+                }
+                own[i] = acc;
+                rd[i]  = (uint16_t) (sycl::bit_cast<uint32_t>(acc) >> 16);
+            });
+            evs.push_back(q[j]->memcpy((uint16_t *) comm->host_out[j] + b0, rd, len * sizeof(uint16_t)));
+        }
+        wait_all();
+
+        // all-gather: card j fetches every other summed chunk and expands it into its own tensor
+        for (int j = 0; j < n; ++j) {
+            for (int c = 0; c < n; ++c) {
+                const int64_t b0 = cbeg(c), len = cbeg(c + 1) - b0;
+                if (c == j || len == 0) {
+                    continue;
+                }
+                const int slot = c < j ? c : c - 1;
+                evs.push_back(q[j]->memcpy(inb[j] + (size_t) slot * cmax,
+                                           (const uint16_t *) comm->host_out[c] + b0, len * sizeof(uint16_t)));
+            }
+        }
+        wait_all();
+        for (int j = 0; j < n; ++j) {
+            float *          dst = (float *) tensors[j]->data;
+            const uint16_t * in  = inb[j];
+            const int        self = j;
+            const int        nn   = n;
+            const int64_t    cm   = cmax;
+            const int64_t    ne   = nelem;
+            // one pass over the N-1 foreign chunks; element i of the tensor belongs to chunk c = owner(i)
+            q[j]->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> id) {
+                const int64_t i = id[0];
+                int c = (int) ((i * nn) / ne);
+                while (c + 1 < nn && (int64_t) (c + 1) * ne / nn <= i) { ++c; }
+                while (c > 0 && (int64_t) c * ne / nn > i) { --c; }
+                if (c == self) {
+                    return;
+                }
+                const int64_t slot = c < self ? c : c - 1;
+                const int64_t off  = i - (int64_t) c * ne / nn;
+                dst[i] = sycl::bit_cast<float>(((uint32_t) in[slot * cm + off]) << 16);
+            });
+        }
+        return true;
+    }
+
     std::vector<uint8_t *> inbox(n);
     std::vector<const void *> send(n);
     for (int j = 0; j < n; ++j) {

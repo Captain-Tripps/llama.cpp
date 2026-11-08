@@ -10885,7 +10885,7 @@ static bool ggml_sycl_comm_allreduce_nway(ggml_backend_sycl_comm_context * comm,
         return s == nullptr || atoi(s) != 0;
     }();
     // GGML_SYCL_COMM_P2P=1: copy partials card to card instead of through host memory. Only possible when all
-    // queues share one SYCL context (true on the Zeus Windows runtime by default); otherwise falls back.
+    // queues share one SYCL context (true on a default Windows B70 runtime); otherwise falls back.
     static const bool p2p_requested = [] {
         const char * s = getenv("GGML_SYCL_COMM_P2P");
         return s != nullptr && atoi(s) != 0;

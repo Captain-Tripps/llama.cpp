@@ -10758,12 +10758,14 @@ struct ggml_backend_sycl_comm_context {
 
     // pinned host staging per device context, reused across calls (queues are in-order)
     std::vector<uint8_t *> host_out;
+    uint8_t * host_in[2] = { nullptr, nullptr };  // N=2 with GGML_SYCL_COMM_X4=1 only (PR #30956 4-buffer path)
     size_t    host_bytes  = 0;
 
     void free_host() {
         for (size_t i = 0; i < host_out.size(); ++i) {
             const sycl::context sctx = ((ggml_backend_sycl_context *) backends[i]->context)->stream()->get_context();
             if (host_out[i]) { sycl::free(host_out[i], sctx); host_out[i] = nullptr; }
+            if (i < 2 && host_in[i]) { sycl::free(host_in[i], sctx); host_in[i] = nullptr; }
         }
         host_bytes = 0;
     }
@@ -10774,6 +10776,12 @@ struct ggml_backend_sycl_comm_context {
 static void ggml_sycl_comm_exchange(ggml_backend_sycl_comm_context * comm, queue_ptr q0, queue_ptr q1,
                                     void * dst0, const void * src1, void * dst1, const void * src0,
                                     size_t nbytes) {
+    // GGML_SYCL_COMM_X4=1: the PR #30956 4-buffer variant (CPU memcpy between the two contexts' host buffers,
+    // uploads not waited on), which that PR uses on Windows. Default: upload straight from the other card's buffer.
+    static const bool x4 = [] {
+        const char * s = getenv("GGML_SYCL_COMM_X4");
+        return s != nullptr && atoi(s) != 0;
+    }();
     if (comm->host_bytes < nbytes) {
         { ggml_sycl_pipe_wait_scope ws_; q0->wait(); }
         { ggml_sycl_pipe_wait_scope ws_; q1->wait(); }
@@ -10781,6 +10789,11 @@ static void ggml_sycl_comm_exchange(ggml_backend_sycl_comm_context * comm, queue
         comm->host_out[0] = sycl::malloc_host<uint8_t>(nbytes, q0->get_context());
         comm->host_out[1] = sycl::malloc_host<uint8_t>(nbytes, q1->get_context());
         GGML_ASSERT(comm->host_out[0] && comm->host_out[1]);
+        if (x4) {
+            comm->host_in[0] = sycl::malloc_host<uint8_t>(nbytes, q0->get_context());
+            comm->host_in[1] = sycl::malloc_host<uint8_t>(nbytes, q1->get_context());
+            GGML_ASSERT(comm->host_in[0] && comm->host_in[1]);
+        }
         comm->host_bytes = nbytes;
     }
 
@@ -10788,6 +10801,13 @@ static void ggml_sycl_comm_exchange(ggml_backend_sycl_comm_context * comm, queue
     sycl::event e1 = q1->memcpy(comm->host_out[1], src1, nbytes);
     { ggml_sycl_pipe_wait_scope ws_; e0.wait(); }
     { ggml_sycl_pipe_wait_scope ws_; e1.wait(); }
+    if (x4) {
+        std::memcpy(comm->host_in[0], comm->host_out[1], nbytes);
+        std::memcpy(comm->host_in[1], comm->host_out[0], nbytes);
+        q0->memcpy(dst0, comm->host_in[0], nbytes);
+        q1->memcpy(dst1, comm->host_in[1], nbytes);
+        return;
+    }
     sycl::event u0 = q0->memcpy(dst0, comm->host_out[1], nbytes);
     sycl::event u1 = q1->memcpy(dst1, comm->host_out[0], nbytes);
     { ggml_sycl_pipe_wait_scope ws_; u0.wait(); }
@@ -10804,12 +10824,15 @@ static void ggml_sycl_comm_exchange(ggml_backend_sycl_comm_context * comm, queue
 // Summing in a fixed order gives identical results on every card for F32 and F16. On the BF16 path a
 // card adds its own partial in FP32 and the others as BF16 (same as the N=2 BF16 path), so the cards
 // can differ in the low bits there.
-template <typename T_own, typename T_in, bool bf16_in>
-static void ggml_sycl_comm_nway_sum(queue_ptr q, T_own * own, const T_in * inbox, int64_t nelem, int n, int self) {
+// NF > 0: card count known at compile time (3 and 4), so the loop over cards unrolls; NF = 0: runtime n.
+template <typename T_own, typename T_in, bool bf16_in, int NF>
+static void ggml_sycl_comm_nway_sum_n(queue_ptr q, T_own * own, const T_in * inbox, int64_t nelem, int n, int self) {
     q->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> id) {
-        const int64_t i = id[0];
+        const int64_t i  = id[0];
+        const int     nn = NF > 0 ? NF : n;
         float acc = 0.0f;
-        for (int c = 0; c < n; ++c) {
+#pragma unroll
+        for (int c = 0; c < nn; ++c) {
             float v;
             if (c == self) {
                 v = (float) own[i];
@@ -10825,6 +10848,48 @@ static void ggml_sycl_comm_nway_sum(queue_ptr q, T_own * own, const T_in * inbox
             acc += v;
         }
         own[i] = (T_own) acc;
+    });
+}
+
+// GGML_SYCL_COMM_FIXN=0: always use the runtime-n kernels
+static bool ggml_sycl_comm_fixn() {
+    static const bool v = [] {
+        const char * s = getenv("GGML_SYCL_COMM_FIXN");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    return v;
+}
+
+template <typename T_own, typename T_in, bool bf16_in>
+static void ggml_sycl_comm_nway_sum(queue_ptr q, T_own * own, const T_in * inbox, int64_t nelem, int n, int self) {
+    if (ggml_sycl_comm_fixn() && n == 3) {
+        ggml_sycl_comm_nway_sum_n<T_own, T_in, bf16_in, 3>(q, own, inbox, nelem, n, self);
+    } else if (ggml_sycl_comm_fixn() && n == 4) {
+        ggml_sycl_comm_nway_sum_n<T_own, T_in, bf16_in, 4>(q, own, inbox, nelem, n, self);
+    } else {
+        ggml_sycl_comm_nway_sum_n<T_own, T_in, bf16_in, 0>(q, own, inbox, nelem, n, self);
+    }
+}
+
+// reduce-scatter step: sum chunk `self` (len elements) in card order, keep FP32 in own, BF16 copy in rd
+template <int NF>
+static void ggml_sycl_comm_rs_sum_n(queue_ptr q, float * own, const uint16_t * in, uint16_t * rd, int64_t len,
+                                    int64_t cm, int n, int self) {
+    q->parallel_for(sycl::range<1>(len), [=](sycl::id<1> id) {
+        const int64_t i  = id[0];
+        const int     nn = NF > 0 ? NF : n;
+        float acc = 0.0f;
+#pragma unroll
+        for (int c = 0; c < nn; ++c) {
+            if (c == self) {
+                acc += own[i];
+            } else {
+                const int64_t slot = c < self ? c : c - 1;
+                acc += sycl::bit_cast<float>(((uint32_t) in[slot * cm + i]) << 16);
+            }
+        }
+        own[i] = acc;
+        rd[i]  = (uint16_t) (sycl::bit_cast<uint32_t>(acc) >> 16);
     });
 }
 
@@ -10952,23 +11017,13 @@ static bool ggml_sycl_comm_allreduce_nway(ggml_backend_sycl_comm_context * comm,
             float *          own = (float *) tensors[j]->data + b0;
             const uint16_t * in  = inb[j];
             uint16_t *       rd  = red[j];
-            const int        self = j;
-            const int        nn   = n;
-            const int64_t    cm   = cmax;
-            q[j]->parallel_for(sycl::range<1>(len), [=](sycl::id<1> id) {
-                const int64_t i = id[0];
-                float acc = 0.0f;
-                for (int c = 0; c < nn; ++c) {
-                    if (c == self) {
-                        acc += own[i];
-                    } else {
-                        const int64_t slot = c < self ? c : c - 1;
-                        acc += sycl::bit_cast<float>(((uint32_t) in[slot * cm + i]) << 16);
-                    }
-                }
-                own[i] = acc;
-                rd[i]  = (uint16_t) (sycl::bit_cast<uint32_t>(acc) >> 16);
-            });
+            if (ggml_sycl_comm_fixn() && n == 3) {
+                ggml_sycl_comm_rs_sum_n<3>(q[j], own, in, rd, len, cmax, n, j);
+            } else if (ggml_sycl_comm_fixn() && n == 4) {
+                ggml_sycl_comm_rs_sum_n<4>(q[j], own, in, rd, len, cmax, n, j);
+            } else {
+                ggml_sycl_comm_rs_sum_n<0>(q[j], own, in, rd, len, cmax, n, j);
+            }
             evs.push_back(q[j]->memcpy((uint16_t *) comm->host_out[j] + b0, rd, len * sizeof(uint16_t)));
         }
         wait_all();
@@ -10986,7 +11041,34 @@ static bool ggml_sycl_comm_allreduce_nway(ggml_backend_sycl_comm_context * comm,
             }
         }
         wait_all();
-        for (int j = 0; j < n; ++j) {
+        // GGML_SYCL_COMM_AG2D=0: the original 1-D expand kernel (owner chunk found per element)
+        static const bool ag2d = [] {
+            const char * s = getenv("GGML_SYCL_COMM_AG2D");
+            return s == nullptr || atoi(s) != 0;
+        }();
+        for (int j = 0; ag2d && j < n; ++j) {
+            // launch over (foreign slot, offset): no owner search, no work-items for the card's own chunk.
+            // chunk c starts at floor(c*ne/n) = c*base + (c*rem)/n; chunk lengths differ by at most one
+            float *          dst  = (float *) tensors[j]->data;
+            const uint16_t * in   = inb[j];
+            const int64_t    self = j;
+            const int64_t    nn   = n;
+            const int64_t    cm   = cmax;
+            const int64_t    base = nelem / n;
+            const int64_t    rem  = nelem % n;
+            q[j]->parallel_for(sycl::range<2>((size_t) (n - 1), (size_t) cmax), [=](sycl::id<2> id) {
+                const int64_t slot  = id[0];
+                const int64_t off   = id[1];
+                const int64_t c     = slot + (slot >= self);
+                const int64_t begin = c * base + (c * rem) / nn;
+                const int64_t end   = (c + 1) * base + ((c + 1) * rem) / nn;
+                if (off >= end - begin) {
+                    return;
+                }
+                dst[begin + off] = sycl::bit_cast<float>(((uint32_t) in[slot * cm + off]) << 16);
+            });
+        }
+        for (int j = 0; !ag2d && j < n; ++j) {
             float *          dst = (float *) tensors[j]->data;
             const uint16_t * in  = inb[j];
             const int        self = j;
